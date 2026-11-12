@@ -97,11 +97,16 @@ function getData() {
   const settings = {};
   rows_('Pengaturan').forEach(function (r) { if (r[0] !== 'pin') settings[r[0]] = r[1]; }); // PIN tidak pernah dikirim ke client
   const jadwal = rows_('Jadwal').map(function (r) {
-    return { id: r[0], nama: r[1], jam: r[2], hari: r[3].split(',').filter(String).map(Number), nada: r[4], aktif: r[5] === 'TRUE' };
+    return { id: r[0], nama: r[1], jam: normJam_(r[2]), hari: String(r[3]).split(',').filter(String).map(Number), nada: r[4], aktif: String(r[5]).toUpperCase() === 'TRUE' };
   }).sort(function (a, b) { return a.jam.localeCompare(b.jam); });
   const riwayat = rows_('Riwayat').slice(-50).reverse().map(function (r) { return { waktu: r[0], nama: r[1], jam: r[2] }; });
   const audio = rows_('Audio').map(function (r) { return { id: r[0], nama: r[1], ukuran: r[3] }; });
   return { settings: settings, jadwal: jadwal, riwayat: riwayat, audio: audio };
+}
+
+function normJam_(v) { // "7:00", "07:00:00" -> "07:00"
+  const m = /(\d{1,2}):(\d{2})/.exec(String(v));
+  return m ? ('0' + m[1]).slice(-2) + ':' + m[2] : String(v);
 }
 
 function saveJadwal(d) {
