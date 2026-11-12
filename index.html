@@ -218,11 +218,14 @@ async function run(fn,...args){
 const fail=e=>Swal.fire({icon:'error',title:'Gagal',text:(e&&e.message||e).replace(/^Error:\s*/,''),confirmButtonColor:'#12263F'});
 
 /* ---------- Data ---------- */
-async function load(){
+const jamParse=t=>{const m=/(\d{1,2}):(\d{2})/.exec(String(t||''));return m?[+m[1],+m[2]]:null;};
+async function load(silent){
   try{
-    S=await run('getData');render();
+    S=await run('getData');
+    S.jadwal.forEach(j=>{const p=jamParse(j.jam);if(p)j.jam=pad(p[0])+':'+pad(p[1]);});
+    render();
     if(S.settings.logo!==logoKey){logoKey=S.settings.logo;applyLogo();}
-  }catch(e){fail(e);}
+  }catch(e){ if(silent) Toast.fire({icon:'warning',title:'Sinkron gagal, memakai data terakhir'}); else fail(e); }
 }
 function render(){
   const st=S.settings;
@@ -237,7 +240,7 @@ function render(){
   $('au').innerHTML=(S.audio||[]).length?S.audio.map(a=>`<tr><td class="c1"><b>${esc(a.nama)}</b></td><td class="c2">${esc(a.ukuran)} KB</td>
     <td class="act"><button class="ic" title="Putar" aria-label="Putar ${esc(a.nama)}" onclick="tesAudio('${a.id}')">${IC.play}</button><button class="ic del" title="Hapus" aria-label="Hapus ${esc(a.nama)}" onclick="hapusAudio('${a.id}')">${IC.del}</button></td></tr>`).join('')
     :'<tr><td colspan="3" class="empty">Belum ada audio. Ketuk “Unggah audio” untuk menambah nada bel sendiri.</td></tr>';
-  S.jadwal.filter(j=>j.aktif&&j.nada.startsWith('audio:')).forEach(j=>audioUrl(j.nada.slice(6)).catch(()=>{})); // siapkan lebih awal agar bel tepat waktu
+  S.jadwal.filter(j=>j.aktif&&j.nada.startsWith('audio:')).forEach(j=>audioData(j.nada.slice(6)).catch(()=>{})); // siapkan lebih awal agar bel tepat waktu
   $('rw').innerHTML=S.riwayat.length?S.riwayat.map(r=>`<tr><td class="c1"><b>${esc(r.nama)}</b></td><td class="c2">${esc(r.jam)}</td><td class="c3">${esc(r.waktu)}</td></tr>`).join('')
     :'<tr><td colspan="3" class="empty">Belum ada bel yang berbunyi.</td></tr>';
   todayKey='';
@@ -304,18 +307,34 @@ async function simpanAtur(){
 $('sVol').oninput=e=>$('vTxt').textContent=e.target.value;
 
 /* ---------- Audio unggahan (disimpan di Drive, dicatat di Sheet) ---------- */
-const AC={}; let cur=null;
+const AC={}; let cur=null, curSrc=null;
 const nadaList=()=>Object.assign({},NADA,...(S.audio||[]).map(a=>({['audio:'+a.id]:'🎵 '+a.nama})));
 const nadaLabel=n=>nadaList()[n]||n;
-async function audioUrl(id){
-  if(AC[id]) return AC[id];
-  const r=await run('getAudioData',id), bin=atob(r.data), u8=new Uint8Array(bin.length);
-  for(let i=0;i<bin.length;i++) u8[i]=bin.charCodeAt(i);
-  return AC[id]=URL.createObjectURL(new Blob([u8],{type:r.mime}));
+function audioData(id){ // ambil dari server sekali, simpan di memori
+  if(!AC[id]) AC[id]=run('getAudioData',id).then(r=>{
+    const bin=atob(r.data), u8=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) u8[i]=bin.charCodeAt(i);
+    return {mime:r.mime,u8,buf:null,url:null};
+  }).catch(e=>{delete AC[id];throw e;});
+  return AC[id];
+}
+function stopAudio(){
+  try{if(cur){cur.pause();cur=null;}}catch(e){}
+  try{if(curSrc){curSrc.stop();curSrc=null;}}catch(e){}
 }
 async function putarAudio(id){
-  if(cur){cur.pause();cur=null;}
-  cur=new Audio(await audioUrl(id)); cur.volume=(S.settings.volume||80)/100; await cur.play();
+  stopAudio();
+  const d=await audioData(id), vol=(S.settings.volume||80)/100;
+  if(ensureCtx()){
+    try{
+      await bangunkan();
+      if(!d.buf) d.buf=await new Promise((ok,no)=>{const p=ctx.decodeAudioData(d.u8.buffer.slice(0),ok,no);if(p&&p.catch)p.catch(no);});
+      const src=ctx.createBufferSource(), g=ctx.createGain();
+      src.buffer=d.buf; g.gain.value=vol; src.connect(g); g.connect(ctx.destination); src.start(); curSrc=src; return;
+    }catch(e){ /* format tidak bisa didekode: coba pemutar biasa */ }
+  }
+  if(!d.url) d.url=URL.createObjectURL(new Blob([d.u8],{type:d.mime}));
+  cur=new Audio(d.url); cur.volume=vol; await cur.play();
 }
 async function tesAudio(id){
   try{await putarAudio(id);}catch(e){fail('Audio tidak dapat diputar. Coba unggah ulang file tersebut.');}
@@ -346,25 +365,59 @@ function tone(f,t,d,type='sine'){
   g.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+t+d);
   o.start(ctx.currentTime+t);o.stop(ctx.currentTime+t+d+.05);
 }
-function bunyi(n){
-  if(n.startsWith('audio:')){putarAudio(n.slice(6)).catch(()=>bunyi('klasik'));return;}
-  if(!ctx) return;
-  if(ctx.state==='suspended') ctx.resume();
-  if(n==='digital'){for(let i=0;i<5;i++)tone(1000,i*.35,.2,'square');}
-  else if(n==='sekolah'){for(let i=0;i<24;i++)tone(i%2?1500:1200,i*.12,.1,'triangle');}
-  else{for(let i=0;i<3;i++){tone(880,i*1.6,1.4,'sine');tone(660,i*1.6+.7,1.6,'sine');}}
+function ensureCtx(){
+  if(!ctx){
+    const A=window.AudioContext||window.webkitAudioContext; if(!A) return null;
+    ctx=new A();
+    ctx.onstatechange=()=>{ if(armed&&ctx.state!=='running') ctx.resume().catch(()=>{}); cekStatus(); };
+  }
+  return ctx;
 }
+function bangunkan(){ // pastikan konteks audio benar-benar berjalan sebelum bunyi
+  if(!ctx||ctx.state==='running') return Promise.resolve();
+  return Promise.race([ctx.resume().catch(()=>{}),new Promise(r=>setTimeout(r,1500))]);
+}
+async function bunyi(n){
+  try{
+    if(n.startsWith('audio:')){ try{await putarAudio(n.slice(6));return;}catch(e){} n='klasik'; }
+    if(!ensureCtx()) return;
+    await bangunkan();
+    if(n==='digital'){for(let i=0;i<5;i++)tone(1000,i*.35,.2,'square');}
+    else if(n==='sekolah'){for(let i=0;i<24;i++)tone(i%2?1500:1200,i*.12,.1,'triangle');}
+    else{for(let i=0;i<3;i++){tone(880,i*1.6,1.4,'sine');tone(660,i*1.6+.7,1.6,'sine');}}
+  }catch(e){}
+}
+let keepAlive=null, manualOff=false, wl=null;
 function aktifkan(){
-  ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();ctx.resume();
-  armed=true;$('arm').classList.add('on');$('armTxt').textContent='Bel otomatis aktif';
+  ensureCtx(); ctx.resume().catch(()=>{});
+  try{ // bunyi senyap: membuka kunci audio di iOS/Safari
+    const sb=ctx.createBufferSource(); sb.buffer=ctx.createBuffer(1,1,22050); sb.connect(ctx.destination); sb.start(0);
+    if(!keepAlive){ // nada nyaris tak terdengar agar konteks audio tidak ditidurkan browser
+      const o=ctx.createOscillator(), g=ctx.createGain(); g.gain.value=0.0001; o.frequency.value=30; o.connect(g); g.connect(ctx.destination); o.start(); keepAlive=o;
+    }
+  }catch(e){}
+  armed=true; manualOff=false; cekStatus(); kunciLayar();
 }
+function cekStatus(){
+  if(!armed){$('arm').classList.remove('on');$('armTxt').textContent='Bel belum aktif';return;}
+  const ok=ctx&&ctx.state==='running';
+  $('arm').classList.toggle('on',!!ok);
+  $('armTxt').textContent=ok?'Bel otomatis aktif':'Ketuk di sini agar suara aktif';
+}
+async function kunciLayar(){ // cegah layar mati/tidur saat bel aktif
+  try{ if(armed&&'wakeLock' in navigator&&document.visibilityState==='visible'&&!wl){
+    wl=await navigator.wakeLock.request('screen'); wl.addEventListener('release',()=>{wl=null;}); } }catch(e){}
+}
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible'&&armed){ bangunkan().then(cekStatus); kunciLayar(); } });
+['pointerdown','keydown','touchend'].forEach(ev=>document.addEventListener(ev,()=>{ if(armed) bangunkan().then(cekStatus); },{passive:true}));
 $('arm').onclick=async()=>{
+  if(armed&&ctx&&ctx.state!=='running'){ await bangunkan(); cekStatus(); if(ctx.state==='running') Toast.fire({icon:'success',title:'Suara aktif kembali'}); return; }
   if(armed){
     const r=await Swal.fire({icon:'question',title:'Matikan bel otomatis?',text:'Bel tidak akan berbunyi sampai diaktifkan lagi.',showCancelButton:true,confirmButtonText:'Matikan',cancelButtonText:'Tetap aktif',confirmButtonColor:'#12263F'});
-    if(r.isConfirmed){armed=false;$('arm').classList.remove('on');$('armTxt').textContent='Bel belum aktif';}
+    if(r.isConfirmed){armed=false;manualOff=true;try{wl&&wl.release();}catch(e){} cekStatus();}
   }else{aktifkan();Toast.fire({icon:'success',title:'Bel otomatis aktif'});}
 };
-function tesBel(){
+async function tesBel(){
   if(!ctx) aktifkan();
   bunyi('klasik');Toast.fire({icon:'info',title:'Memutar nada tes'});
 }
@@ -401,18 +454,31 @@ function tick(){
     $('cd').textContent=`dalam ${h?h+' jam ':''}${pad(m)} menit ${pad(s%60)} detik`;
   }else{$('nx').textContent='Belum ada jadwal aktif';$('cd').textContent='';}
   renderToday(now);
-  if(!armed) return;
-  const hm=`${pad(now.getHours())}:${pad(now.getMinutes())}`,key0=now.toDateString();
+  cekStatus(); cekBel(now);
+}
+let lastTick=Date.now();
+function cekBel(now){
+  const nowMs=now.getTime(), from=Math.max(lastTick,nowMs-120000); // tangkap bel yang terlewat s.d. 2 menit (timer browser bisa tertunda)
+  lastTick=nowMs;
   S.jadwal.forEach(j=>{
-    const k=key0+j.id+j.jam;
-    if(j.aktif&&j.jam===hm&&j.hari.includes(now.getDay())&&!rung[k]){
-      rung[k]=1;bunyi(j.nada);run('logBell',j.nama,j.jam).catch(()=>{});
-      Swal.fire({icon:'info',iconColor:'#E0A526',title:j.nama,text:`Sekarang pukul ${j.jam}`,timer:12000,timerProgressBar:true,confirmButtonText:'Tutup',confirmButtonColor:'#12263F'});
-    }
+    if(!j.aktif) return;
+    const p=jamParse(j.jam); if(!p) return;
+    const t=new Date(now); t.setHours(p[0],p[1],0,0);
+    if(!j.hari.includes(t.getDay())) return;
+    if(!(t.getTime()>from&&t.getTime()<=nowMs)) return;
+    const k=now.toDateString()+j.id+j.jam;
+    if(rung[k]) return; rung[k]=1;
+    if(!armed){ Toast.fire({icon:'warning',title:`Bel “${j.nama}” tidak berbunyi: bel otomatis belum diaktifkan`,timer:8000}); return; }
+    bunyi(j.nada); run('logBell',j.nama,j.jam).catch(()=>{});
+    Swal.fire({icon:'info',iconColor:'#E0A526',title:j.nama,text:`Sekarang pukul ${j.jam}`,timer:12000,timerProgressBar:true,confirmButtonText:'Tutup',confirmButtonColor:'#12263F'});
   });
 }
 setInterval(tick,1000);
-setInterval(load,5*60*1000); // sinkron ulang dengan Google Sheet
+try{ // pewaktu di Web Worker tidak ikut diperlambat saat tab di latar belakang
+  const w=new Worker(URL.createObjectURL(new Blob(['setInterval(function(){postMessage(0)},1000)'],{type:'text/javascript'})));
+  w.onmessage=tick;
+}catch(e){}
+setInterval(()=>load(true),5*60*1000); // sinkron ulang dengan Google Sheet
 
 /* ---------- Tab ---------- */
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
